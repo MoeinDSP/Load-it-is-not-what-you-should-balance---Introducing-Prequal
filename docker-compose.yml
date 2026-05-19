@@ -1,0 +1,162 @@
+# Replicates the paper's multi-tenant testbed (§5):
+#
+#  ┌─────────────────────────────────────────────────────────┐
+#  │  server1  CPU_LOAD=60  (antagonist-contended, ~35ms)    │
+#  │  server2  CPU_LOAD=60  (antagonist-contended, ~35ms)    │
+#  │  server3  CPU_LOAD=0   (clean machine,         ~8ms)    │
+#  └─────────────────────────────────────────────────────────┘
+#
+#  lb-prequal   :8080  — Prequal (HCL + async probing)
+#  lb-weightedrr :8081  — WRR baseline (smoothed EWMA weights)
+#
+#  Both load balancers hit the same three backends simultaneously so that
+#  the compare.sh script can reproduce Figure 6 of the paper.
+#
+#  Prometheus  :9090
+#  Grafana     :3001  (admin/admin)
+
+version: "3.9"
+
+networks:
+  prequal-net:
+    driver: bridge
+
+# ── Backend servers ───────────────────────────────────────────────────────────
+services:
+  server1:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      PORT: "80"
+      SERVER_ID: "server1"
+      CPU_LOAD: "60"        # antagonist-contended: adds ~35ms extra latency
+      MAX_CONCURRENCY: "1"  # 1/0.035s ≈ 28 req/s capacity; WRR equal routing saturates at 3×28=86 req/s
+    networks:
+      - prequal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "256m"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  server2:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      PORT: "80"
+      SERVER_ID: "server2"
+      CPU_LOAD: "60"        # antagonist-contended
+      MAX_CONCURRENCY: "1"
+    networks:
+      - prequal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "256m"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  server3:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      PORT: "80"
+      SERVER_ID: "server3"
+      CPU_LOAD: "0"         # clean machine, no antagonists
+      MAX_CONCURRENCY: "5"  # 5/0.008s ≈ 625 req/s capacity
+    networks:
+      - prequal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "256m"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+# ── Load balancers ────────────────────────────────────────────────────────────
+  lb-prequal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      LB_PORT: "8080"
+      LB_ALGORITHM: "prequal"
+      LB_SERVERS: "server1=server1:80,server2=server2:80,server3=server3:80"
+      LB_QRIF: "0.84"
+      LB_PROBE_RATE: "2"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - server1
+      - server2
+      - server3
+    networks:
+      - prequal-net
+    restart: unless-stopped
+
+  lb-weightedrr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      LB_PORT: "8080"
+      LB_ALGORITHM: "weightedrr"
+      LB_SERVERS: "server1=server1:80,server2=server2:80,server3=server3:80"
+      LB_WEIGHT_INTERVAL: "30s"  # slow refresh mirrors paper's trailing CPU-util signal
+    ports:
+      - "8081:8080"
+    depends_on:
+      - server1
+      - server2
+      - server3
+    networks:
+      - prequal-net
+    restart: unless-stopped
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - prequal-net
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--storage.tsdb.retention.time=7d"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/loadbalancer.json"
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - prequal-net

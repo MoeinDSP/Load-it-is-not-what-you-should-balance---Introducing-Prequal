@@ -1,0 +1,228 @@
+{
+  "title": "Prequal vs WRR — NSDI '24 Replication",
+  "uid": "prequal-nsdi24",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "tags": ["prequal", "load-balancing"],
+  "annotations": { "list": [] },
+  "templating": {
+    "list": [
+      {
+        "name": "algorithm",
+        "type": "custom",
+        "label": "Algorithm",
+        "query": "prequal,weightedrr",
+        "current": { "value": ["prequal", "weightedrr"], "text": ["prequal", "weightedrr"] },
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Latency — p50 / p99 / p99.9  (Fig. 5 & 6a)",
+      "description": "Normalized latency per algorithm. Prequal's tail should remain flat even above 100% allocation; WRR's p99.9 should spike first.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*p99_9.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*p99[^_].*" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*p50.*" },    "properties": [{ "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.999, sum(rate(lb_request_duration_seconds_bucket{algorithm=~\"$algorithm\"}[30s])) by (le, algorithm))",
+          "legendFormat": "{{algorithm}} p99.9",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(lb_request_duration_seconds_bucket{algorithm=~\"$algorithm\"}[30s])) by (le, algorithm))",
+          "legendFormat": "{{algorithm}} p99",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(lb_request_duration_seconds_bucket{algorithm=~\"$algorithm\"}[30s])) by (le, algorithm))",
+          "legendFormat": "{{algorithm}} p90",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(lb_request_duration_seconds_bucket{algorithm=~\"$algorithm\"}[30s])) by (le, algorithm))",
+          "legendFormat": "{{algorithm}} p50",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error Rate  (Fig. 6b)",
+      "description": "WRR errors should increase sharply above 100% allocation; Prequal should stay near zero.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lb_request_errors_total{algorithm=~\"$algorithm\"}[30s])) by (algorithm)",
+          "legendFormat": "{{algorithm}} errors/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Throughput (req/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        {
+          "expr": "sum(rate(lb_request_duration_seconds_count{algorithm=~\"$algorithm\"}[30s])) by (algorithm)",
+          "legendFormat": "{{algorithm}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Requests-In-Flight per Server — Prequal  (Fig. 4 bottom)",
+      "description": "Prequal drives RIF on server1/server2 toward zero, keeping traffic on server3.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "server3 (clean)" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "server1 (contended)" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "server2 (contended)" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
+        ]
+      },
+      "targets": [
+        { "expr": "lb_server_rif{algorithm=\"prequal\",server_id=\"server1\"}", "legendFormat": "server1 (contended)", "refId": "A" },
+        { "expr": "lb_server_rif{algorithm=\"prequal\",server_id=\"server2\"}", "legendFormat": "server2 (contended)", "refId": "B" },
+        { "expr": "lb_server_rif{algorithm=\"prequal\",server_id=\"server3\"}", "legendFormat": "server3 (clean)", "refId": "C" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Requests-In-Flight per Server — WRR  (Fig. 4 bottom)",
+      "description": "WRR distributes RIF across all servers including contended ones.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2 } }
+      },
+      "targets": [
+        { "expr": "lb_server_rif{algorithm=\"weightedrr\",server_id=\"server1\"}", "legendFormat": "server1 (contended)", "refId": "A" },
+        { "expr": "lb_server_rif{algorithm=\"weightedrr\",server_id=\"server2\"}", "legendFormat": "server2 (contended)", "refId": "B" },
+        { "expr": "lb_server_rif{algorithm=\"weightedrr\",server_id=\"server3\"}", "legendFormat": "server3 (clean)", "refId": "C" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Server Selection Distribution  (traffic steering)",
+      "description": "Prequal should route ~100% to server3. WRR distributes proportionally to all servers.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 20, "w": 24, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1 }
+      },
+      "targets": [
+        {
+          "expr": "rate(lb_server_selection_total{algorithm=~\"$algorithm\"}[30s]) / ignoring(server_id) group_left sum(rate(lb_server_selection_total{algorithm=~\"$algorithm\"}[30s])) by (algorithm)",
+          "legendFormat": "{{algorithm}} → {{server_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Observed Probe Latency per Server (ms)",
+      "description": "Prequal probes detect server1/server2 latency is ~4x server3. This is the real-time signal that drives steering.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 26, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [
+        { "expr": "lb_server_latency_ms{algorithm=\"prequal\"}", "legendFormat": "Prequal → {{server_id}}", "refId": "A" },
+        { "expr": "lb_server_latency_ms{algorithm=\"weightedrr\"}", "legendFormat": "WRR → {{server_id}}", "refId": "B" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Antagonist CPU Load per Server  (Fig. 2 analogue)",
+      "description": "server1 and server2 simulate 60% antagonist CPU contention; server3 is a clean machine.",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 26, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 40 },
+              { "color": "red", "value": 60 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto" },
+      "targets": [
+        { "expr": "lb_server_cpu_load_pct{algorithm=\"prequal\"}", "legendFormat": "{{server_id}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Active Requests Total (sum of client-side RIF)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 5 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "lb_active_requests{algorithm=~\"$algorithm\"}", "legendFormat": "{{algorithm}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Server Health",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 5 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "lb_server_health", "legendFormat": "{{server_id}} ({{algorithm}})", "refId": "A" }
+      ]
+    }
+  ]
+}

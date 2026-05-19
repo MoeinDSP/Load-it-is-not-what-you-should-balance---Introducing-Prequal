@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "lb-prequal"
+    static_configs:
+      - targets: ["lb-prequal:8080"]
+    metrics_path: /metrics
+    relabel_configs:
+      - target_label: algorithm
+        replacement: prequal
+
+  - job_name: "lb-weightedrr"
+    static_configs:
+      - targets: ["lb-weightedrr:8080"]
+    metrics_path: /metrics
+    relabel_configs:
+      - target_label: algorithm
+        replacement: weightedrr
