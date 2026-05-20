@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # compare.sh — replicates Figure 6 of the Prequal paper (NSDI '24).
 #
-# Backend capacity model (matches docker-compose.yml settings):
-#   server1/2  CPU_LOAD=60  MAX_CONCURRENCY=1  latency≈35ms  → ~28 req/s each
-#   server3    CPU_LOAD=0   MAX_CONCURRENCY=5  latency≈8ms   → ~625 req/s
+# Backend capacity model (docker-compose.yml):
+#   server1/2  CPU_LOAD=60  MAX_CONCURRENCY=3  latency≈44ms  → ~68 req/s each
+#   server3    CPU_LOAD=0   MAX_CONCURRENCY=20 latency≈8ms   → ~2500 req/s
 #
-# WRR capacity (equal distribution, bottlenecked at server1/2):
-#   1 concurrent / 0.035 s × 3 servers ≈ 86 req/s  ← this is BASELINE
+# bgload container sends 20 req/s to each of server1/2, consuming ~29% of their
+# capacity — simulating the antagonist VMs from the paper.  This is visible in
+# server-local RIF (X-RIF header that Prequal probes read) but NOT in either
+# LB's own latency observations.
 #
-# Prequal capacity (routes ~95% to server3):
-#   5 concurrent / 0.008 s ≈ 625 req/s
+# Remaining capacity after bgload:  server1/2 = 68-20 = 48 req/s each
+# WRR capacity (equal routing, stale weights that never update):
+#   3 × 48 ≈ 144 req/s  ← BASELINE (rounded to 141 for clean arithmetic)
+#
+# Prequal routes ~95% to server3 → capacity ≈ 2500 req/s → zero errors
 #
 # Expected paper results (Figure 6):
-#   ≤100% load : both algorithms fine, ~8ms p99 (Prequal steers to server3)
-#   ~103%      : WRR p99 starts climbing; Prequal unchanged
-#   ~114%+     : WRR returns 503 errors; Prequal zero errors
+#   ≤100%  both algorithms fine — below server1/2 saturation
+#   ~103%  WRR errors begin (server1/2 saturate); Prequal zero errors
+#   ≥114%  WRR error rate climbs; Prequal remains zero errors
 #
 # Requirements:
 #   hey   — brew install hey
@@ -27,11 +32,12 @@ set -euo pipefail
 DURATION=30          # seconds per load level
 PREQUAL_URL="http://localhost:8080"
 WRR_URL="http://localhost:8081"
-WORKERS=15           # concurrent hey workers (fixed)
+WORKERS=15           # concurrent hey workers
 
-# WRR capacity = MAX_CONCURRENCY_server12 / latency_server12 × 3_servers
-# = 1 / 0.035 × 3 ≈ 86 req/s.  Override with --baseline if you change backends.
-BASELINE=86
+# WRR capacity with bgload (20 req/s) on server1/2 (actual capacity ≈68 req/s each
+# at MAX_CONCURRENCY=3 and ~44ms avg latency):
+#   remaining = 48 req/s per server × 3 servers = 144 req/s ≈ BASELINE
+BASELINE=141
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 usage() {
@@ -87,29 +93,29 @@ check_services() {
 check_deps
 check_services
 
-# ── Warmup (fills Prequal probe pool; WRR intentionally NOT warmed up) ────────
-# Only Prequal gets a warmup so its probe pool has fresh RIF/latency entries.
-# WRR starts the experiment with equal weights (EWMALatency=20ms initial for all
-# servers) — this mirrors the paper's WRR whose CPU-utilization weights haven't
-# yet adapted to the antagonist load, reproducing the trailing-signal weakness.
+# ── Warmup: only Prequal — WRR must start with stale equal weights ─────────────
+# Prequal needs probe pool entries showing server1/2 have high RIF (from bgload).
+# WRR intentionally gets no warmup so it starts with EWMALatency=20ms for all
+# servers → equal routing → routes into the bgload-saturated server1/2.
 echo ""
-echo "Warming up Prequal probe pool (10s)..."
-hey -z 10s -q 1 -c "$WORKERS" "$PREQUAL_URL" >/dev/null 2>&1
-echo "Warmup done.  Baseline WRR capacity: ${BASELINE} req/s"
+echo "Warming up Prequal probe pool (15s) — bgload is running on server1/2..."
+hey -z 15s -q 1 -c "$WORKERS" "$PREQUAL_URL" >/dev/null 2>&1
+echo "Warmup done.  Baseline WRR capacity: ${BASELINE} req/s  (68 req/s capacity − 20 bgload = 48 available per server × 3)"
+echo "(bgload sends 20 req/s to each of server1/2 — raises X-RIF, invisible to WRR latency)"
 
 # ── Load levels (×10/9 each step, matching paper §5.1) ────────────────────────
-# hey -q is PER WORKER; divide target total QPS by number of workers.
+# hey -q is PER WORKER; we compute per-worker rate from total desired QPS.
 LEVELS=(0.75 0.83 0.93 1.03 1.14 1.27 1.41 1.57 1.74)
 NAMES=("75%" "83%" "93%" "103%" "114%" "127%" "141%" "157%" "174%")
 RESULTS_DIR="/tmp/prequal_compare_$(date +%s)"
 mkdir -p "$RESULTS_DIR"
 
 echo ""
-echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║         Prequal vs WRR — Load Ramp (Figure 6 Replication)          ║"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
-printf "║  %-8s  %-8s  %-18s  %-18s  ║\n" "Load" "QPS" "Prequal p99 (ms)" "WRR p99 (ms)"
-echo "╠══════════════════════════════════════════════════════════════════════╣"
+echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+echo "║            Prequal vs WRR — Load Ramp (Figure 6 Replication)               ║"
+echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+printf "║  %-8s  %-8s  %-24s  %-24s  ║\n" "Load" "QPS" "Prequal p99" "WRR p99"
+echo "╠══════════════════════════════════════════════════════════════════════════════╣"
 
 for i in "${!LEVELS[@]}"; do
     level="${LEVELS[$i]}"
@@ -120,19 +126,17 @@ for i in "${!LEVELS[@]}"; do
     pfile="$RESULTS_DIR/prequal_step${i}.txt"
     wfile="$RESULTS_DIR/wrr_step${i}.txt"
 
-    # Run both algorithms simultaneously (parallel background jobs).
-    hey -z "${DURATION}s" -q "$per_worker" -c "$WORKERS" "$PREQUAL_URL" > "$pfile" 2>&1 &
-    PID_P=$!
-    hey -z "${DURATION}s" -q "$per_worker" -c "$WORKERS" "$WRR_URL"    > "$wfile" 2>&1 &
-    PID_W=$!
+    # Run algorithms sequentially so they don't double-load the shared backends.
+    # Prequal first (probe pool is warm), then WRR (equal stale weights throughout).
+    hey -z "${DURATION}s" -q "$per_worker" -c "$WORKERS" "$PREQUAL_URL" > "$pfile" 2>&1
+    sleep 3
+    hey -z "${DURATION}s" -q "$per_worker" -c "$WORKERS" "$WRR_URL"    > "$wfile" 2>&1
 
-    wait $PID_P $PID_W
-
-    # hey outputs "99%% in X secs" (double-percent in terminal).
+    # hey outputs "99%% in X secs" (double-percent in terminal output).
     p99_prequal=$(grep "99%%" "$pfile" | awk '{printf "%.0f", $3*1000}')
     p99_wrr=$(    grep "99%%" "$wfile" | awk '{printf "%.0f", $3*1000}')
 
-    # Count non-2xx responses (hey formats as "  [503]	N responses" with leading spaces).
+    # Count non-2xx responses as errors.
     err_p=$(awk '/\[/ && !/\[200\]/ && /responses/ {for(i=1;i<=NF;i++) if($i~/^[0-9]+$/ && $i+0>0) sum+=$i+0} END{print sum+0}' "$pfile" 2>/dev/null || echo 0)
     err_w=$(awk '/\[/ && !/\[200\]/ && /responses/ {for(i=1;i<=NF;i++) if($i~/^[0-9]+$/ && $i+0>0) sum+=$i+0} END{print sum+0}' "$wfile" 2>/dev/null || echo 0)
 
@@ -144,17 +148,17 @@ for i in "${!LEVELS[@]}"; do
     [[ "$err_p" -gt 0 ]] && p_label="${p99_prequal}ms (${err_p} err)"
     [[ "$err_w" -gt 0 ]] && w_label="${p99_wrr}ms (${err_w} err)"
 
-    printf "║  %-8s  %-8s  %-18s  %-18s  ║\n" "$name" "${total_qps}/s" "$p_label" "$w_label"
+    printf "║  %-8s  %-8s  %-24s  %-24s  ║\n" "$name" "${total_qps}/s" "$p_label" "$w_label"
 
-    [[ $i -lt $((${#LEVELS[@]} - 1)) ]] && sleep 3
+    [[ $i -lt $((${#LEVELS[@]} - 1)) ]] && sleep 5
 done
 
-echo "╚══════════════════════════════════════════════════════════════════════╝"
+echo "╚══════════════════════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Detailed hey output saved in: $RESULTS_DIR"
 echo ""
 echo "View live metrics in Grafana: http://localhost:3001  (admin/admin)"
 echo "  - 'Request Latency'   → Fig. 5 (tail latency)"
 echo "  - 'Error Rate'        → Fig. 6b (WRR errors above 103%)"
-echo "  - 'RIF per Server'    → Fig. 4 (Prequal avoids server1/2)"
+echo "  - 'RIF per Server'    → Fig. 4 (Prequal steers away from loaded servers)"
 echo "  - 'Traffic Steering'  → Prequal routes ~95%+ to server3"

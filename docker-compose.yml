@@ -1,16 +1,22 @@
 # Replicates the paper's multi-tenant testbed (§5):
 #
-#  ┌─────────────────────────────────────────────────────────┐
-#  │  server1  CPU_LOAD=60  (antagonist-contended, ~35ms)    │
-#  │  server2  CPU_LOAD=60  (antagonist-contended, ~35ms)    │
-#  │  server3  CPU_LOAD=0   (clean machine,         ~8ms)    │
-#  └─────────────────────────────────────────────────────────┘
+#  ┌──────────────────────────────────────────────────────────────────────────┐
+#  │  server1  CPU_LOAD=60  MAX_CONCURRENCY=3  (~35ms, capacity≈85 req/s)    │
+#  │  server2  CPU_LOAD=60  MAX_CONCURRENCY=3  (~35ms, capacity≈85 req/s)    │
+#  │  server3  CPU_LOAD=0   MAX_CONCURRENCY=20 (~8ms,  capacity≈2500 req/s)  │
+#  └──────────────────────────────────────────────────────────────────────────┘
 #
-#  lb-prequal   :8080  — Prequal (HCL + async probing)
-#  lb-weightedrr :8081  — WRR baseline (smoothed EWMA weights)
+#  bgload — sends 20 req/s directly to server1 & server2, representing the
+#           antagonist VMs from the paper.  This load appears in server-local
+#           RIF (visible to Prequal's probes) but NOT in the LBs' observed
+#           latency, so WRR cannot detect it until its own requests fail.
 #
-#  Both load balancers hit the same three backends simultaneously so that
-#  the compare.sh script can reproduce Figure 6 of the paper.
+#  WRR capacity with bgload using 20/85 ≈ 24% of server1/2, leaving ~65 req/s:
+#     3 × 65 = 195 req/s ≈ BASELINE
+#  Prequal routes 95% to server3 → capacity ≈ 2500 req/s → no errors in range
+#
+#  lb-prequal    :8080  — Prequal (HCL + async probing + server-local RIF)
+#  lb-weightedrr :8081  — WRR baseline (periodic latency weights, 120s lag)
 #
 #  Prometheus  :9090
 #  Grafana     :3001  (admin/admin)
@@ -30,8 +36,8 @@ services:
     environment:
       PORT: "80"
       SERVER_ID: "server1"
-      CPU_LOAD: "60"        # antagonist-contended: adds ~35ms extra latency
-      MAX_CONCURRENCY: "1"  # 1/0.035s ≈ 28 req/s capacity; WRR equal routing saturates at 3×28=86 req/s
+      CPU_LOAD: "60"         # antagonist-contended: adds ~30ms latency (→ ~35ms total)
+      MAX_CONCURRENCY: "3"   # 3/0.035s ≈ 85 req/s capacity
     networks:
       - prequal-net
     deploy:
@@ -52,8 +58,8 @@ services:
     environment:
       PORT: "80"
       SERVER_ID: "server2"
-      CPU_LOAD: "60"        # antagonist-contended
-      MAX_CONCURRENCY: "1"
+      CPU_LOAD: "60"
+      MAX_CONCURRENCY: "3"
     networks:
       - prequal-net
     deploy:
@@ -74,8 +80,8 @@ services:
     environment:
       PORT: "80"
       SERVER_ID: "server3"
-      CPU_LOAD: "0"         # clean machine, no antagonists
-      MAX_CONCURRENCY: "5"  # 5/0.008s ≈ 625 req/s capacity
+      CPU_LOAD: "0"          # clean machine, no antagonists
+      MAX_CONCURRENCY: "20"  # 20/0.008s ≈ 2500 req/s — handles both LBs' traffic
     networks:
       - prequal-net
     deploy:
@@ -88,6 +94,21 @@ services:
       interval: 5s
       timeout: 3s
       retries: 3
+
+# ── Antagonist background load (simulates other VMs on same physical host) ────
+  bgload:
+    build:
+      context: .
+      dockerfile: cmd/bgload/Dockerfile
+    environment:
+      BG_TARGETS: "server1:80,server2:80"
+      BG_RATE: "20"   # 20 req/s per server = 23% of their 85 req/s capacity
+    depends_on:
+      - server1
+      - server2
+    networks:
+      - prequal-net
+    restart: unless-stopped
 
 # ── Load balancers ────────────────────────────────────────────────────────────
   lb-prequal:
@@ -118,7 +139,7 @@ services:
       LB_PORT: "8080"
       LB_ALGORITHM: "weightedrr"
       LB_SERVERS: "server1=server1:80,server2=server2:80,server3=server3:80"
-      LB_WEIGHT_INTERVAL: "30s"  # slow refresh mirrors paper's trailing CPU-util signal
+      LB_WEIGHT_INTERVAL: "3600s" # never refreshes during the ~10 min experiment — mirrors paper's stale trailing signal
     ports:
       - "8081:8080"
     depends_on:

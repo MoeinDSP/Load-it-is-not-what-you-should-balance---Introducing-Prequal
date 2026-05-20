@@ -158,7 +158,8 @@ func (lb *LoadBalancer) probeAllServers() {
 
 	for _, srv := range servers {
 		go func(s *Server) {
-			res := lb.probeServer(s)
+			firedAt := time.Now() // capture fire time before round-trip so all probes in the batch share
+			res := lb.probeServer(s) // a comparable age — prevents fast servers from being evicted as "oldest"
 			if res == nil {
 				return
 			}
@@ -190,7 +191,7 @@ func (lb *LoadBalancer) probeAllServers() {
 					Server:    s,
 					RIF:       res.serverRIF,
 					LatencyMs: res.latencyMs,
-					Timestamp: time.Now(),
+					Timestamp: firedAt,
 					MaxUses:   maxUses,
 				})
 			}
@@ -270,6 +271,7 @@ func (lb *LoadBalancer) triggerAsyncProbes() {
 	for i := 0; i < n; i++ {
 		srv := servers[indices[i]]
 		go func(s *Server) {
+			firedAt := time.Now()
 			res := lb.probeServer(s)
 			if res == nil || !res.isHealthy {
 				return
@@ -286,7 +288,7 @@ func (lb *LoadBalancer) triggerAsyncProbes() {
 				Server:    s,
 				RIF:       res.serverRIF,
 				LatencyMs: res.latencyMs,
-				Timestamp: time.Now(),
+				Timestamp: firedAt,
 				MaxUses:   lb.computeBreuse(),
 			})
 		}(srv)
@@ -346,8 +348,10 @@ func (lb *LoadBalancer) recomputeWRRWeights() {
 //
 //	breuse = max(1, (1+δ) / ((1 - m/n) * rprobe - rremove))
 //
-// When n ≤ m (fewer servers than pool capacity, as in our 3-server testbed)
-// the formula would give ≤ 1, so we clamp to 1.
+// The paper's formula assumes n >> m (large replica set, small pool).  When
+// n ≤ m — as in our 3-server testbed — the denominator is negative and the
+// formula is undefined.  We fall back to pool_size/n + 1 so that each pool
+// slot is reused ~(m/n) times before eviction, keeping the pool filled.
 func (lb *LoadBalancer) computeBreuse() int {
 	lb.mu.RLock()
 	n := float64(len(lb.servers))
@@ -363,7 +367,13 @@ func (lb *LoadBalancer) computeBreuse() int {
 
 	denom := (1.0 - m/n) * rp - rr
 	if denom <= 0 {
-		return 1
+		// Small testbed fallback: reuse each entry m/n times so the pool
+		// doesn't deplete faster than probes can refill it.
+		v := int(m/n) + 1
+		if v < 1 {
+			return 1
+		}
+		return v
 	}
 	v := (1.0 + d) / denom
 	if v < 1 {

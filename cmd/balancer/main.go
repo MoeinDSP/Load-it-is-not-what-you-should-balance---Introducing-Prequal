@@ -51,11 +51,11 @@ func main() {
 	metrics := loadbalancer.NewMetrics(reg)
 
 	cfg := &loadbalancer.Config{
-		ProbeInterval:        time.Second,
+		ProbeInterval:        200 * time.Millisecond, // 5× more frequent probing keeps pool fresh
 		ProbeTimeout:         2 * time.Second,
 		HealthCheckPath:      "/health",
 		ProbePoolSize:        16,
-		ProbeAgeTimeout:      time.Second,
+		ProbeAgeTimeout:      5 * time.Second, // entries valid for 5s; stable bgload means this is safe
 		ProbeRatePerQuery:    probeRate,
 		ProbeRemoveRate:      1.0,
 		DriftRate:            1.0,
